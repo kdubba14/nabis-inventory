@@ -37,6 +37,7 @@ export interface inventoryUpdate {
 export interface skuBatchUpdate {
   skuBatchId: string;
   updates: inventoryUpdate[];
+  skuBatchItem?: SkuBatchData;
 }
 
 export interface SkuBatchToSkuId {
@@ -51,3 +52,8 @@ export interface SkuBatchToSkuId {
 export interface WMSWarehouseMeta {
   warehouseId: string;
 }
+
+export type WithOptional<T, K extends keyof T> = Omit<T, K> &
+  Partial<Pick<T, K>>;
+export type RestOptional<T, K extends keyof T> = Pick<T, K> &
+  Partial<Omit<T, K>>;

@@ -1,4 +1,3 @@
-import { snakeCase } from "lodash";
 import {
   WMSWarehouseMeta,
   inventoryUpdate,
@@ -16,11 +15,14 @@ import {
   warehouseData,
 } from "./db/data";
 import {
-  getUpdateForSkuBatchRecord,
-  insertify,
-  queryExec,
-  formatSqlValue,
-} from "./db/sql.util";
+  ReturnResponse,
+  insertInventoryAggregateItemsViaApi,
+  insertInventoryItemsViaApi,
+  isInventoryAggregateItemArray,
+  isInventoryItemArray,
+  updateInventoryAggregateItemsViaApi,
+  updateInventoryItemsViaApi,
+} from "./api/inventory";
 
 const logger = console;
 
@@ -50,12 +52,12 @@ const makeWarehouseRecordsForSkuBatchRecord = (
  */
 export async function skuBatchToInserts(
   skuBatchIdsToInsert: string[]
-): Promise<string[]> {
+): Promise<ReturnResponse> {
   const badSkuBatchCounter = { count: 0 };
 
   // create our inserts
-  const inserts: string[] = skuBatchIdsToInsert
-    .reduce((arr: RecordWithWMS[], skuBatchId: string): RecordWithWMS[] => {
+  const inserts = skuBatchIdsToInsert.reduce(
+    (arr: RecordWithWMS[], skuBatchId: string): RecordWithWMS[] => {
       const skuBatchRecordFromAppDb: SkuBatchToSkuId | undefined = appData.find(
         (skuBatchToSkuId: SkuBatchToSkuId): boolean =>
           skuBatchToSkuId.skuBatchId === skuBatchId
@@ -73,14 +75,24 @@ export async function skuBatchToInserts(
         ...makeWarehouseRecordsForSkuBatchRecord(skuBatchRecordFromAppDb)
       );
       return arr;
-    }, [])
-    .map(insertify);
+    },
+    []
+  );
+
+  const res = await insertInventoryItemsViaApi(inserts);
+  const res2 = await insertInventoryAggregateItemsViaApi(
+    inserts.map((i) => ({ ...i, wmsId: String(i.wmsId) }))
+  );
 
   logger.log(
     `created inserts [count=${inserts.length}, badSkuBatchRecordCount=${badSkuBatchCounter.count}]`
   );
 
-  return inserts;
+  return {
+    error:
+      (res.error ?? "") + (res.error && res2.error ? " + " + res2.error : ""),
+    success: res.success && res2.success,
+  };
 }
 
 /**
@@ -106,30 +118,6 @@ export async function getDeltas(): Promise<string[]> {
 }
 
 /**
- * Builds list of SQL updates - this is a pretty simple function to turn a delta
- * into a SQL update
- * @param delta
- */
-export const makeUpdates = (delta: skuBatchUpdate): string[] => {
-  // convert updates to sql and push updates
-  const updatesToMake = delta.updates
-    .map(
-      (ud: inventoryUpdate) =>
-        `${snakeCase(ud.field)} = ${formatSqlValue(ud.newValue)}`
-    )
-    .join("; ");
-
-  return [
-    getUpdateForSkuBatchRecord("inventory", updatesToMake, delta.skuBatchId),
-    getUpdateForSkuBatchRecord(
-      "inventory_aggregate",
-      updatesToMake,
-      delta.skuBatchId
-    ),
-  ];
-};
-
-/**
  * Finds the deltas between two lists of SkuBatchData
  * @param appSkuBatchData
  * @param inventorySkuBatchData
@@ -137,7 +125,7 @@ export const makeUpdates = (delta: skuBatchUpdate): string[] => {
 export const findDeltas = (
   appSkuBatchData: SkuBatchData[],
   inventorySkuBatchData: SkuBatchData[]
-): skuBatchUpdate[] => {
+): SkuBatchData[] => {
   logger.log(
     "finding data changes between inventory and app SkuBatch datasets"
   );
@@ -188,27 +176,31 @@ export const findDeltas = (
       return {
         skuBatchId: inventoryRecord.skuBatchId,
         updates,
+        skuBatchItem: updates.length ? appSbd : undefined,
       };
     })
     .filter((sbu: skuBatchUpdate) => {
-      return sbu.updates.length > 0;
-    });
+      return !!sbu.skuBatchItem;
+    })
+    .map((sbu) => sbu.skuBatchItem as SkuBatchData);
 };
 
 /**
- * Finds changes in data between the app SkuBatch+Sku and inventory tables
+ *  Finds & Updates changes in data between the app SkuBatch+Sku and inventory tables
  */
-export async function findChangesBetweenDatasets(): Promise<string[]> {
+export async function updateFromChangesBetweenDatasets(): Promise<
+  SkuBatchData[]
+> {
   logger.log(
     "finding app SkuBatch data that has changed and <> the inventory data"
   );
 
-  const updates: string[] = await [appSkuBatchData].reduce(
+  const updates = await [appSkuBatchData].reduce(
     async (
-      accumPromise: Promise<string[]>,
+      accumPromise: Promise<SkuBatchData[]>,
       inventorySkuBatchData: SkuBatchData[]
     ) => {
-      const accum: string[] = await accumPromise;
+      const accum = await accumPromise;
       const skuBatchIds: string[] = inventorySkuBatchData.map(
         (sbd: SkuBatchData) => sbd.skuBatchId
       );
@@ -236,15 +228,12 @@ export async function findChangesBetweenDatasets(): Promise<string[]> {
       }
 
       // push our new sql updates into the accumulator list
-      const ds: string[] = findDeltas(
-        appSkuBatchData,
-        inventorySkuBatchData
-      ).flatMap((delta: skuBatchUpdate) => makeUpdates(delta));
+      const ds = findDeltas(appSkuBatchData, inventorySkuBatchData);
 
       accum.push(...ds);
       return accum;
     },
-    Promise.resolve([] as string[])
+    Promise.resolve([])
   );
 
   logger.log(`built updates [count=${updates.length}]`);
@@ -264,8 +253,8 @@ export async function copyMissingInventoryRecordsFromSkuBatch(): Promise<void | 
     `copying new skuBatch records... [skuBatchCount=${skuBatchIdsToInsert.length}]`
   );
   try {
-    const inserts = await skuBatchToInserts(skuBatchIdsToInsert);
-    await queryExec({}, inserts);
+    const res = await skuBatchToInserts(skuBatchIdsToInsert);
+    if (res.error || !res.success) throw res.error;
   } catch (err) {
     logger.error(err);
     throw err;
@@ -282,8 +271,13 @@ export async function updateInventoryDeltasFromSkuBatch(): Promise<void> {
   logger.log('updating inventory from deltas in "SkuBatch" data');
 
   try {
-    const sqlUpdates: string[] = await findChangesBetweenDatasets();
-    await queryExec({}, sqlUpdates);
+    const updates = await updateFromChangesBetweenDatasets();
+    if (isInventoryItemArray(updates)) {
+      await updateInventoryItemsViaApi(updates);
+    }
+    if (isInventoryAggregateItemArray(updates)) {
+      await updateInventoryAggregateItemsViaApi(updates);
+    }
   } catch (err) {
     logger.error(err);
     throw err;
@@ -305,3 +299,5 @@ export async function sync(): Promise<void | Error> {
     return Promise.reject(err);
   }
 }
+
+// NOTE: the APIs always return 404 unless I mock them
